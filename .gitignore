@@ -1,11 +1,4 @@
-**data/in_cluto/*
-!**data/in_cluto/.keep
-**data/out_cluto/*
-!**data/out_cluto/.keep
-**data/in_slim/*
-!**data/in_slim/.keep
-**data/out_slim/*
-!**data/out_slim/.keep
-**/data/*
+**data/*
+!*.keep
 **/old/*
 **/tools/*

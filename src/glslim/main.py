@@ -13,6 +13,7 @@ import pandas as pd
 import numpy as np
 import subprocess
 import operator
+import random
 import sys
 import re
 
@@ -46,7 +47,8 @@ gu = None
 # VARIAVEIS DE CONTROLE. Ex: num_usuarios, iteracões, num_clusters, etc
 num_usuarios = 0
 num_itens = 0
-tolerancia_treinamento = 1e-2
+tolerancia_treinamento = 1e-5
+N = 10
 
 def inicializa_variaveis_globais():
     global caminho_projeto, dir_dados, dir_entrada_cluto, dir_saida_cluto, dir_entrada_slim_learn, \
@@ -94,11 +96,13 @@ def calcula_clusters_com_cluto(caminho_matriz_cluto, nome_arq_saida_cluto, num_c
     return
 
 
-def estimar_matriz_S_com_sim_learn(caminho_matriz_treinamento, caminho_matriz_saida_modelo,
-    coluna_inicial=0, coluna_final=None, optTol=1e-2):
+def estima_matriz_S_com_sim_learn(caminho_matriz_treinamento, caminho_matriz_saida_modelo,
+    coluna_inicial=0, coluna_final=None, optTol=1e-2, lambda_p=1, beta_p=5):
     parametros_bash = [slim, "-train_file=%s"%(caminho_matriz_treinamento), 
                     '-optTol=%f'%(optTol),
-                    "-model_file=%s"%(caminho_matriz_saida_modelo)]
+                    '-model_file=%s'%(caminho_matriz_saida_modelo),
+                    '-lambda=%f'%(lambda_p),
+                    '-beta=%f'%(beta_p)]
     if coluna_final:
         parametros_bash.append("-starti=%d"%(coluna_inicial))
         parametros_bash.append("-endi=%d"%(coluna_final))
@@ -132,14 +136,82 @@ def calcula_submatrizes_Pu():
     return
 
 
+def retorna_lista_itens_avaliados_pelo_usuario(usuario):
+    return R_global.ix[usuario,:].index[R_global.ix[usuario,:] == 1].tolist()
+
+
+# FIXME:
 def avalia_modelo():
-    pass
+    for usuario in range(num_usuarios):
+        indices_itens_avaliados_pelo_usuario = retorna_lista_itens_avaliados_pelo_usuario(usuario)
+        itens_treino, item_teste = divide_itens_treino_teste(indices_itens_avaliados_pelo_usuario)
+        # Ajusta matriz R_global para teste
+        R_global.ix[usuario, item_teste] = 0
+
+        estima_modelo_slim_global()        
+        su_global = le_matriz_em_formato_csr_sem_cabecalho("%s/%s.global.csr"%(dir_saida_slim_learn,nome_dataset),(num_itens,num_itens))
+
+        estima_modelo_slim_para_todos_clusters()
+        atualiza_estrutura_dados_su_cluster()
+
+        top_n = calcula_top_n(usuario, indices_itens_avaliados_pelo_usuario)
+
+        # desfaz ajuste matriz R_global
+        R_global.ix[usuario, item_teste] = 1
+
+
+def divide_itens_treino_teste(lista_itens):
+    itens_treino = lista_itens[:]
+    item_teste = selecionar_item_aleatoriamente(itens_treino)
+    itens_treino.remove(item_teste)
+    return itens_treino, item_teste
     
+
+def calcula_top_n(usuario, indices_itens_avaliados_pelo_usuario):
+    predicao = [None for item in range(num_itens)]
+    for item in range(num_itens):
+        predicao[item] = calcula_predicao_usuario_item(usuario, vetor_clusters_usuarios[usuario], item, gu[usuario], indices_itens_avaliados_pelo_usuario)
+    ranking = [item[0] for item in sorted(enumerate(predicao), key=lambda x:x[1])]
+    if num_itens < N:
+        return ranking[0:num_itens]
+    else:
+        return ranking[0:N]
+
+
+def selecionar_item_aleatoriamente(lista_itens):
+    return random.sample(lista_itens,1)
+
+
+def estima_modelo_slim_global():
+    # Estima modelo global (matrix R completa)
+    estima_matriz_S_com_sim_learn("%s/%s.R.global.bin.csr"%(dir_entrada_slim_learn,nome_dataset),
+            "%s/%s.global.csr"%(dir_saida_slim_learn,nome_dataset),optTol=tolerancia_treinamento)
+    return
+
+
+# calcula modelo SLIM para cada submatriz de clusters
+def estima_modelo_slim_para_todos_clusters():
+    for cluster in range(num_clusters):
+        # Estima modelo global (matrix R completa)
+        estima_matriz_S_com_sim_learn("%s/%s.ru.%d.bin.csr"%(dir_entrada_slim_learn,nome_dataset,cluster),
+                "%s/%s.local.%d.csr"%(dir_saida_slim_learn,nome_dataset,cluster),optTol=tolerancia_treinamento)
+    return
+
+
+# atualiza estrutura de su de cada cluster atualizado no passo anterior (diretorio out_slim)
+def atualiza_estrutura_dados_su_cluster():
+    global su_cluster
+    if su_cluster == None:
+        su_cluster = [None for cluster in range(num_clusters)]
+    for cluster in range(num_clusters):
+        su_cluster[cluster] = le_matriz_em_formato_csr_sem_cabecalho("%s/%s.local.%d.csr"%(dir_saida_slim_learn,nome_dataset,cluster),(num_itens,num_itens))
+    return
+
 
 def glslim():
     global gu, R_global, su_global, su_cluster, vetor_clusters_usuarios
     gu = 0.5 * np.ones((num_usuarios))
-    # cria_matriz_R_binaria_a_partir_matriz_avaliacoes()
+    
     R_global = le_matriz_em_formato_csr_sem_cabecalho("%s/%s.R.global.bin.csr"%(dir_entrada_slim_learn,nome_dataset),(num_usuarios,num_itens))
     calcula_clusters_com_cluto('%s/%s.R.csr'%(dir_entrada_cluto,nome_dataset),\
         '%s/%s.%d.csr'%(dir_saida_cluto,nome_dataset,num_clusters), num_clusters)
@@ -147,30 +219,20 @@ def glslim():
 
     percentual_mudancas = 1
     while percentual_mudancas > 0.01:
-        novo_cluster = [None for usuario in range(num_usuarios)]
-        # Estima modelo global (matrix R completa)
-        estimar_matriz_S_com_sim_learn("%s/%s.R.global.bin.csr"%(dir_entrada_slim_learn,nome_dataset),
-                "%s/%s.global.csr"%(dir_saida_slim_learn,nome_dataset),optTol=1e-3)
+        novo_cluster = vetor_clusters_usuarios.tolist()
         
+        estima_modelo_slim_global()        
         # carrega modelos su (em out_slim) de cada cluster
         su_global = le_matriz_em_formato_csr_sem_cabecalho("%s/%s.global.csr"%(dir_saida_slim_learn,nome_dataset),(num_itens,num_itens))
-    
-        # calcula modelo SLIM para cada submatriz de clusters
-        for cluster in range(num_clusters):
-            # Estima modelo global (matrix R completa)
-            estimar_matriz_S_com_sim_learn("%s/%s.ru.%d.bin.csr"%(dir_entrada_slim_learn,nome_dataset,cluster),
-                    "%s/%s.local.%d.csr"%(dir_saida_slim_learn,nome_dataset,cluster),optTol=1e-3)
-        
-        # atualiza estrutura de su de cada cluster atualizado no passo anterior
-        su_cluster = [None for cluster in range(num_clusters)]
-        for cluster in range(num_clusters):
-            su_cluster[cluster] = le_matriz_em_formato_csr_sem_cabecalho("%s/%s.local.%d.csr"%(dir_saida_slim_learn,nome_dataset,cluster),(num_itens,num_itens))
+
+        estima_modelo_slim_para_todos_clusters()
+        atualiza_estrutura_dados_su_cluster()
 
         for usuario in range(num_usuarios):
             erros_treinamento = []
             gu_por_cluster = []
             # indices das colunas dos itens avaliados pelo usuario (=1)
-            indices_itens_avaliados_pelo_usuario = R_global.ix[usuario,:].index[R_global.ix[usuario,:] == 1].tolist()
+            indices_itens_avaliados_pelo_usuario = retorna_lista_itens_avaliados_pelo_usuario(usuario)
             # calcula gus para todos os clusters. Ao fim, escolhe o cluster de menor erro e atribui gu correspondente
             for cluster in range(num_clusters):
                 gu_cluster = calcula_gu(usuario, cluster, indices_itens_avaliados_pelo_usuario)
@@ -197,6 +259,9 @@ def glslim():
         percentual_mudancas = float(mudanca_cluster)/num_usuarios
         # atualiza vetor de usuario/cluster
         vetor_clusters_usuarios = pd.Series(novo_cluster)
+        calcula_submatrizes_Pu()
+        estima_modelo_slim_para_todos_clusters()
+        atualiza_estrutura_dados_su_cluster()
         print('Percentual de mudancas: %f\n'%(percentual_mudancas))
         
     return
@@ -208,6 +273,7 @@ def main():
     arq_avaliacoes = pd.read_csv(dir_matriz_avaliacoes, header=None)
     num_usuarios, num_itens = arq_avaliacoes.shape
     glslim()
+    avalia_modelo()
     return
 
 
@@ -248,6 +314,9 @@ def calcula_gu(usuario, cluster, indices_itens_avaliados_pelo_usuario):
         num = num + (soma_sli - soma_suli) * (R_global.ix[usuario,item] - soma_suli)
         den = den + (soma_sli - soma_suli)**2
 
+    # evita NaN
+    if den == 0.0:
+        return 0.0
     return num/den
         
         
@@ -288,6 +357,8 @@ def le_matriz_em_formato_csr_sem_cabecalho(dir_matriz, dimensao_matriz):
 
 
 if __name__ == "__main__":
+    # reproducibilidade
+    random.seed(1234)
     inicializa_variaveis_globais()
     main()
     
