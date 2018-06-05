@@ -12,6 +12,7 @@ Diretorio matrizes saida SLIM_LEARN: ./data/out_slim/
 import pandas as pd
 import numpy as np
 import subprocess
+import operator
 import sys
 import re
 
@@ -89,7 +90,7 @@ def calcula_clusters_com_cluto(caminho_matriz_cluto, nome_arq_saida_cluto, num_c
     subprocess.call(["rm", "-f", nome_arq_saida_cluto])
     subprocess.call([cluto, caminho_matriz_cluto, str(num_clusters), "-clustfile=" + nome_arq_saida_cluto, "-colmodel=none"])
     global vetor_clusters_usuarios
-    vetor_clusters_usuarios = pd.read_csv(nome_arq_saida_cluto, header=None)
+    vetor_clusters_usuarios = pd.read_csv(nome_arq_saida_cluto, header=None)[0]
     return
 
 
@@ -97,8 +98,9 @@ def estimar_matriz_S_com_sim_learn(caminho_matriz_treinamento, caminho_matriz_sa
     coluna_inicial=0, coluna_final=None, optTol=1e-2):
     parametros_bash = [slim, "-train_file=%s"%(caminho_matriz_treinamento), 
                     '-optTol=%f'%(optTol),
-                     "-model_file=%s"%(caminho_matriz_saida_modelo), "-starti=%d"%(coluna_inicial)]
+                    "-model_file=%s"%(caminho_matriz_saida_modelo)]
     if coluna_final:
+        parametros_bash.append("-starti=%d"%(coluna_inicial))
         parametros_bash.append("-endi=%d"%(coluna_final))
     subprocess.call(["rm", "-f", caminho_matriz_saida_modelo])
     subprocess.call(parametros_bash)
@@ -122,7 +124,7 @@ def calcula_submatrizes_Pu():
         Ru_cluster[cluster] = np.copy(R_global)
         linhas_para_zerar = ~vetor_clusters_usuarios.isin([cluster])
         contador_linha = 0
-        for linha in linhas_para_zerar[0]:
+        for linha in linhas_para_zerar:
             if linha:
                 Ru_cluster[cluster][contador_linha,:] = Ru_cluster[cluster][contador_linha,:] * 0
             contador_linha = contador_linha + 1
@@ -130,8 +132,12 @@ def calcula_submatrizes_Pu():
     return
 
 
+def avalia_modelo():
+    pass
+    
+
 def glslim():
-    global gu, R_global, su_global, su_cluster
+    global gu, R_global, su_global, su_cluster, vetor_clusters_usuarios
     gu = 0.5 * np.ones((num_usuarios))
     # cria_matriz_R_binaria_a_partir_matriz_avaliacoes()
     R_global = le_matriz_em_formato_csr_sem_cabecalho("%s/%s.R.global.bin.csr"%(dir_entrada_slim_learn,nome_dataset),(num_usuarios,num_itens))
@@ -144,7 +150,7 @@ def glslim():
         novo_cluster = [None for usuario in range(num_usuarios)]
         # Estima modelo global (matrix R completa)
         estimar_matriz_S_com_sim_learn("%s/%s.R.global.bin.csr"%(dir_entrada_slim_learn,nome_dataset),
-                "%s/%s.global.csr"%(dir_saida_slim_learn,nome_dataset),optTol=1e-1)
+                "%s/%s.global.csr"%(dir_saida_slim_learn,nome_dataset),optTol=1e-3)
         
         # carrega modelos su (em out_slim) de cada cluster
         su_global = le_matriz_em_formato_csr_sem_cabecalho("%s/%s.global.csr"%(dir_saida_slim_learn,nome_dataset),(num_itens,num_itens))
@@ -153,7 +159,7 @@ def glslim():
         for cluster in range(num_clusters):
             # Estima modelo global (matrix R completa)
             estimar_matriz_S_com_sim_learn("%s/%s.ru.%d.bin.csr"%(dir_entrada_slim_learn,nome_dataset,cluster),
-                    "%s/%s.local.%d.csr"%(dir_saida_slim_learn,nome_dataset,cluster),optTol=1e-1)
+                    "%s/%s.local.%d.csr"%(dir_saida_slim_learn,nome_dataset,cluster),optTol=1e-3)
         
         # atualiza estrutura de su de cada cluster atualizado no passo anterior
         su_cluster = [None for cluster in range(num_clusters)]
@@ -162,12 +168,26 @@ def glslim():
 
         for usuario in range(num_usuarios):
             erros_treinamento = []
+            gu_por_cluster = []
+            # indices das colunas dos itens avaliados pelo usuario (=1)
+            indices_itens_avaliados_pelo_usuario = R_global.ix[usuario,:].index[R_global.ix[usuario,:] == 1].tolist()
+            # calcula gus para todos os clusters. Ao fim, escolhe o cluster de menor erro e atribui gu correspondente
             for cluster in range(num_clusters):
-                gu[usuario] = calcula_gu(usuario, cluster)
-                erro = calcula_erro_predicao(usuario)
+                gu_cluster = calcula_gu(usuario, cluster, indices_itens_avaliados_pelo_usuario)
+                # em alguns casos, gu sai do intervalo [0,1], workaround:
+                gu_cluster = max(0, gu_cluster)
+                gu_cluster = min(1, gu_cluster)
+                
+                gu_por_cluster.append(gu_cluster)
+
+                erro = calcula_erro_predicao(usuario, cluster, gu_cluster, indices_itens_avaliados_pelo_usuario)
                 erros_treinamento.append(erro)
-            min_idx, min_valor = min(enumerate(erros_treinamento))
-            novo_cluster[usuario] = min_idx
+            # escolhe novo cluster do usuario
+            min_idx, min_valor = min(enumerate(erros_treinamento), key=operator.itemgetter(1))
+            # se houver empate, nao atualiza
+            if (min_valor < erros_treinamento[vetor_clusters_usuarios[usuario]]):
+                novo_cluster[usuario] = min_idx
+                gu[usuario] = gu_por_cluster[min_idx]
         
         # numero de clusters diferentes na iteracao
         mudanca_cluster = 0
@@ -175,6 +195,8 @@ def glslim():
             if vetor_clusters_usuarios[usuario] != novo_cluster[usuario]:
                 mudanca_cluster = mudanca_cluster + 1
         percentual_mudancas = float(mudanca_cluster)/num_usuarios
+        # atualiza vetor de usuario/cluster
+        vetor_clusters_usuarios = pd.Series(novo_cluster)
         print('Percentual de mudancas: %f\n'%(percentual_mudancas))
         
     return
@@ -194,31 +216,28 @@ def verifica_clustering():
     return True
 
 
-def calcula_predicao_usuario_item(usuario, item):
-    indices_itens_avaliados_pelo_usuario = R_global.ix[usuario,:].index[R_global.ix[usuario,:] == 1].tolist()
+def calcula_predicao_usuario_item(usuario, cluster, item, gu_cluster, indices_itens_avaliados_pelo_usuario):
     predicao = 0
-    cluster_do_usuario = vetor_clusters_usuarios[0][usuario]
     for item_avaliado in indices_itens_avaliados_pelo_usuario:
-        predicao = predicao + gu[usuario] * su_global.ix[item_avaliado,item]  + (1 - gu[usuario]) * su_cluster[cluster_do_usuario].ix[item_avaliado,item]
+        predicao = predicao + gu_cluster * su_global.ix[item_avaliado,item]  + (1 - gu_cluster) * su_cluster[cluster].ix[item_avaliado,item]
     
     return predicao
     
 
-def calcula_erro_predicao(usuario):
+def calcula_erro_predicao(usuario, cluster, gu_cluster, indices_itens_avaliados_pelo_usuario):
     predicao = [0 for item in range(num_itens)]
     erro = 0
     for item in range(num_itens):
-        predicao[item] = calcula_predicao_usuario_item(usuario, item)
-        erro = (arq_avaliacoes.ix[usuario,item] - predicao[item]) ** 2
+        predicao[item] = calcula_predicao_usuario_item(usuario, cluster, item, gu_cluster, indices_itens_avaliados_pelo_usuario)
+        erro = erro + (arq_avaliacoes.ix[usuario,item] - predicao[item]) ** 2
     
     erro = erro/num_itens
     return erro
 
     
-def calcula_gu(usuario, cluster):
+def calcula_gu(usuario, cluster, indices_itens_avaliados_pelo_usuario):
     # u eh o usuario da iteracao
     num = den = 0
-    indices_itens_avaliados_pelo_usuario = R_global.ix[usuario,:].index[R_global.ix[usuario,:] == 1].tolist()
     for item in range(num_itens):
         soma_sli = 0
         soma_suli = 0
