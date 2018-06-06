@@ -208,8 +208,8 @@ def avalia_modelo():
         estima_modelo_slim_global()        
         su_global = le_matriz_em_formato_csr_sem_cabecalho("%s/%s.global.csr"%(dir_saida_slim_learn,nome_dataset),(num_itens,num_itens))
 
-        estima_modelo_slim_para_todos_clusters()
-        atualiza_estrutura_dados_su_cluster()
+        estima_modelo_slim_para_todos_clusters_paralelizado()
+        atualiza_estrutura_dados_su_cluster_paralelizado()
 
         top_n = calcula_top_n(usuario, indices_itens_avaliados_pelo_usuario)
 
@@ -301,10 +301,11 @@ def glslim_treinamento_usuario(usuario):
     # calcula gus para todos os clusters. Ao fim, escolhe o cluster de menor erro e atribui gu correspondente
     for cluster in range(num_clusters):
         gu_cluster = calcula_gu(usuario, cluster, indices_itens_avaliados_pelo_usuario)
-        # em alguns casos, gu sai do intervalo [0,1], workaround:
+        
+        # em alguns casos, gu sai do intervalo [0,1], work-around:
         gu_cluster = max(0, gu_cluster)
         gu_cluster = min(1, gu_cluster)
-        
+
         gu_por_cluster.append(gu_cluster)
 
         erro = calcula_erro_predicao(usuario, cluster, gu_cluster, indices_itens_avaliados_pelo_usuario)
@@ -375,12 +376,19 @@ def calcula_predicao_usuario_item(usuario, cluster, item, gu_cluster, indices_it
     return predicao
     
 
+# calcula erro para todos os itens nao avaliados pelo usuario
+def retorna_itens_nao_avaliados_pelo_usuario(indices_itens_avaliados_pelo_usuario):
+    indices_itens_nao_avaliados_pelo_usuario = set(range(num_itens))
+    indices_itens_nao_avaliados_pelo_usuario.difference_update(indices_itens_avaliados_pelo_usuario)
+    return indices_itens_nao_avaliados_pelo_usuario
+
+
 def calcula_erro_predicao(usuario, cluster, gu_cluster, indices_itens_avaliados_pelo_usuario):
-    predicao = [0 for item in range(num_itens)]
     erro = 0
-    for item in range(num_itens):
-        predicao[item] = calcula_predicao_usuario_item(usuario, cluster, item, gu_cluster, indices_itens_avaliados_pelo_usuario)
-        erro = erro + (arq_avaliacoes.ix[usuario,item] - predicao[item]) ** 2
+    indices_itens_nao_avaliados_pelo_usuario = retorna_itens_nao_avaliados_pelo_usuario(indices_itens_avaliados_pelo_usuario)
+    for item in indices_itens_nao_avaliados_pelo_usuario:
+        predicao = calcula_predicao_usuario_item(usuario, cluster, item, gu_cluster, indices_itens_avaliados_pelo_usuario)
+        erro = erro + (arq_avaliacoes.ix[usuario,item] - predicao) ** 2
     
     erro = erro/num_itens
     return erro
@@ -439,6 +447,10 @@ def le_matriz_em_formato_csr_sem_cabecalho(dir_matriz, dimensao_matriz):
         linha = arq.readline()
     arq.close()
     return pd.DataFrame(matriz)
+
+
+def leave_one_out_cross_validation():
+    pass
 
 
 def main():
