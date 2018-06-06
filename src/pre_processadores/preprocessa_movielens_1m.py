@@ -49,6 +49,14 @@ num_amostras = 50
 movie_lens_sampled = movie_lens.sample(n=num_amostras, axis=0).sample(n=num_amostras, axis=1)
 esparsidade_dataset_sampled = float(movie_lens_sampled[movie_lens_sampled != 0].count().sum())/movie_lens_sampled.size
 
+## REMOVE COLUNAS COM TODOS OS VALORES ZERO
+colunas_diferentes_de_zero = movie_lens_sampled.apply(sum, axis=0) != 0
+movie_lens_sampled = movie_lens_sampled.loc[:,colunas_diferentes_de_zero]
+
+## REMOVE LINHAS COM TODOS OS VALORES ZERO
+linhas_diferentes_de_zero = movie_lens_sampled.apply(sum, axis=1) != 0
+movie_lens_sampled = movie_lens_sampled.loc[linhas_diferentes_de_zero,:]
+
 movie_lens_sampled.to_csv("%s/%s.csv"%(diretorio_matriz_avaliacoes, nome_dataset), header=False, index=False)
 
 def escreve_em_formato_csr_com_cabecalho(nome_arquivo, df, binario=True):
@@ -98,5 +106,5 @@ def escreve_em_formato_csr_sem_cabecalho_binario(nome_arquivo, df):
         saida.write("\n")   
     saida.close()
     
-escreve_em_formato_csr_sem_cabecalho_binario('%s/%s.R.csr'%(diretorio_matriz_ru_em_csr,nome_dataset), movie_lens_sampled)
+escreve_em_formato_csr_sem_cabecalho_binario('%s/%s.R.global.bin.csr'%(diretorio_matriz_ru_em_csr,nome_dataset), movie_lens_sampled)
 escreve_em_formato_csr_com_cabecalho('%s/%s.R.csr'%(diretorio_matriz_cluto_em_csr,nome_dataset), movie_lens_sampled)

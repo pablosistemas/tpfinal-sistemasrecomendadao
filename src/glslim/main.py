@@ -12,6 +12,7 @@ Diretorio matrizes saida SLIM_LEARN: ./data/out_slim/
 import pandas as pd
 import numpy as np
 import subprocess
+import threading
 import operator
 import random
 import sys
@@ -38,6 +39,7 @@ dir_matriz_avaliacoes = ''
 # MATRIZES E VETORES
 vetor_clusters_usuarios = None
 arq_avaliacoes = None
+novo_vetor_clusters_usuarios = None
 Ru_cluster = None
 su_cluster = None
 su_global = None
@@ -49,6 +51,43 @@ num_usuarios = 0
 num_itens = 0
 tolerancia_treinamento = 1e-5
 N = 10
+
+
+class slim_thread(threading.Thread):
+    def __init__(self, cluster, tolerancia_treinamento):
+        threading.Thread.__init__(self)
+        self.cluster = cluster
+        self.tolerancia_treinamento = tolerancia_treinamento
+    def run(self):
+        estima_matriz_S_com_sim_learn("%s/%s.ru.%d.bin.csr"%(dir_entrada_slim_learn,nome_dataset,self.cluster),
+                "%s/%s.local.%d.csr"%(dir_saida_slim_learn,nome_dataset,self.cluster),optTol=self.tolerancia_treinamento)
+        return
+
+
+class calcula_submatrizes_pu_thread(threading.Thread):
+    def __init__(self, cluster):
+        threading.Thread.__init__(self)
+        self.cluster = cluster
+    def run(self):
+        calcula_submatriz_Pu(self.cluster)
+
+
+class glslim_thread(threading.Thread):
+    def __init__(self, usuario):
+        threading.Thread.__init__(self)
+        self.usuario = usuario
+    def run(self):
+        glslim_treinamento_usuario(self.usuario)
+
+
+class atualiza_estrutura_dados_su_cluster_thread(threading.Thread):
+    def __init__(self, cluster):
+        threading.Thread.__init__(self)
+        self.cluster = cluster
+    def run(self):
+        global su_cluster
+        su_cluster[self.cluster] = le_matriz_em_formato_csr_sem_cabecalho("%s/%s.local.%d.csr"%(dir_saida_slim_learn,nome_dataset,self.cluster),(num_itens,num_itens))
+
 
 def inicializa_variaveis_globais():
     global caminho_projeto, dir_dados, dir_entrada_cluto, dir_saida_cluto, dir_entrada_slim_learn, \
@@ -120,19 +159,37 @@ def cria_matriz_R_binaria_a_partir_matriz_avaliacoes():
     return
 
 
+def calcula_submatriz_Pu(cluster):
+    global Ru_cluster
+    Ru_cluster[cluster] = np.copy(R_global)
+    linhas_para_zerar = ~vetor_clusters_usuarios.isin([cluster])
+    contador_linha = 0
+    for linha in linhas_para_zerar:
+        if linha:
+            Ru_cluster[cluster][contador_linha,:] = Ru_cluster[cluster][contador_linha,:] * 0
+        contador_linha = contador_linha + 1
+    escreve_matriz_em_formato_csr(Ru_cluster[cluster], "%s/%s.ru.%d.bin.csr"%(dir_entrada_slim_learn,nome_dataset,cluster))
+
+
+def calcula_submatrizes_Pu_paralelizado():
+    global Ru_cluster
+    Ru_cluster = [None for cluster in range(num_clusters)]
+    threads = []
+    for cluster in range(num_clusters):
+        thread = calcula_submatrizes_pu_thread(cluster)
+        thread.start()
+        threads.append(thread)
+    
+    for thread in threads:
+        thread.join()
+
+
 def calcula_submatrizes_Pu():
     global Ru_cluster
     Ru_cluster = [None for cluster in range(num_clusters)]
 
     for cluster in range(num_clusters):
-        Ru_cluster[cluster] = np.copy(R_global)
-        linhas_para_zerar = ~vetor_clusters_usuarios.isin([cluster])
-        contador_linha = 0
-        for linha in linhas_para_zerar:
-            if linha:
-                Ru_cluster[cluster][contador_linha,:] = Ru_cluster[cluster][contador_linha,:] * 0
-            contador_linha = contador_linha + 1
-        escreve_matriz_em_formato_csr(Ru_cluster[cluster], "%s/%s.ru.%d.bin.csr"%(dir_entrada_slim_learn,nome_dataset,cluster))
+        calcula_submatriz_Pu(cluster)
     return
 
 
@@ -190,6 +247,17 @@ def estima_modelo_slim_global():
 
 
 # calcula modelo SLIM para cada submatriz de clusters
+def estima_modelo_slim_para_todos_clusters_paralelizado():
+    threads = []
+    for cluster in range(num_clusters):
+        thread = slim_thread(cluster, tolerancia_treinamento)
+        thread.start()
+        threads.append(thread)
+    
+    for thread in threads:
+        thread.join()
+
+    
 def estima_modelo_slim_para_todos_clusters():
     for cluster in range(num_clusters):
         # Estima modelo global (matrix R completa)
@@ -199,6 +267,22 @@ def estima_modelo_slim_para_todos_clusters():
 
 
 # atualiza estrutura de su de cada cluster atualizado no passo anterior (diretorio out_slim)
+def atualiza_estrutura_dados_su_cluster_paralelizado():
+    global su_cluster
+    if su_cluster == None:
+        su_cluster = [None for cluster in range(num_clusters)]
+    
+    threads = []
+    for cluster in range(num_clusters):
+        thread = atualiza_estrutura_dados_su_cluster_thread(cluster)
+        thread.start()
+        threads.append(thread)
+    
+    for thread in threads:
+        thread.join()
+    return
+
+
 def atualiza_estrutura_dados_su_cluster():
     global su_cluster
     if su_cluster == None:
@@ -208,72 +292,73 @@ def atualiza_estrutura_dados_su_cluster():
     return
 
 
+def glslim_treinamento_usuario(usuario):
+    global gu, novo_vetor_clusters_usuarios
+    erros_treinamento = []
+    gu_por_cluster = []
+    # indices das colunas dos itens avaliados pelo usuario (=1)
+    indices_itens_avaliados_pelo_usuario = retorna_lista_itens_avaliados_pelo_usuario(usuario)
+    # calcula gus para todos os clusters. Ao fim, escolhe o cluster de menor erro e atribui gu correspondente
+    for cluster in range(num_clusters):
+        gu_cluster = calcula_gu(usuario, cluster, indices_itens_avaliados_pelo_usuario)
+        # em alguns casos, gu sai do intervalo [0,1], workaround:
+        gu_cluster = max(0, gu_cluster)
+        gu_cluster = min(1, gu_cluster)
+        
+        gu_por_cluster.append(gu_cluster)
+
+        erro = calcula_erro_predicao(usuario, cluster, gu_cluster, indices_itens_avaliados_pelo_usuario)
+        erros_treinamento.append(erro)
+    # escolhe novo cluster do usuario
+    min_idx, min_valor = min(enumerate(erros_treinamento), key=operator.itemgetter(1))
+    # se houver empate, nao atualiza
+    if (min_valor < erros_treinamento[vetor_clusters_usuarios[usuario]]):
+        novo_vetor_clusters_usuarios[usuario] = min_idx
+        gu[usuario] = gu_por_cluster[min_idx]
+
+
 def glslim():
-    global gu, R_global, su_global, su_cluster, vetor_clusters_usuarios
+    global gu, R_global, su_global, su_cluster, vetor_clusters_usuarios, novo_vetor_clusters_usuarios
     gu = 0.5 * np.ones((num_usuarios))
     
     R_global = le_matriz_em_formato_csr_sem_cabecalho("%s/%s.R.global.bin.csr"%(dir_entrada_slim_learn,nome_dataset),(num_usuarios,num_itens))
     calcula_clusters_com_cluto('%s/%s.R.csr'%(dir_entrada_cluto,nome_dataset),\
         '%s/%s.%d.csr'%(dir_saida_cluto,nome_dataset,num_clusters), num_clusters)
-    calcula_submatrizes_Pu()
+    calcula_submatrizes_Pu_paralelizado()
 
     percentual_mudancas = 1
     while percentual_mudancas > 0.01:
-        novo_cluster = vetor_clusters_usuarios.tolist()
+        novo_vetor_clusters_usuarios = vetor_clusters_usuarios.tolist()
         
         estima_modelo_slim_global()        
         # carrega modelos su (em out_slim) de cada cluster
         su_global = le_matriz_em_formato_csr_sem_cabecalho("%s/%s.global.csr"%(dir_saida_slim_learn,nome_dataset),(num_itens,num_itens))
 
-        estima_modelo_slim_para_todos_clusters()
-        atualiza_estrutura_dados_su_cluster()
+        estima_modelo_slim_para_todos_clusters_paralelizado()
+        atualiza_estrutura_dados_su_cluster_paralelizado()
 
+        threads = []
         for usuario in range(num_usuarios):
-            erros_treinamento = []
-            gu_por_cluster = []
-            # indices das colunas dos itens avaliados pelo usuario (=1)
-            indices_itens_avaliados_pelo_usuario = retorna_lista_itens_avaliados_pelo_usuario(usuario)
-            # calcula gus para todos os clusters. Ao fim, escolhe o cluster de menor erro e atribui gu correspondente
-            for cluster in range(num_clusters):
-                gu_cluster = calcula_gu(usuario, cluster, indices_itens_avaliados_pelo_usuario)
-                # em alguns casos, gu sai do intervalo [0,1], workaround:
-                gu_cluster = max(0, gu_cluster)
-                gu_cluster = min(1, gu_cluster)
-                
-                gu_por_cluster.append(gu_cluster)
+            thread = glslim_thread(usuario)
+            thread.start()
+            threads.append(thread)
 
-                erro = calcula_erro_predicao(usuario, cluster, gu_cluster, indices_itens_avaliados_pelo_usuario)
-                erros_treinamento.append(erro)
-            # escolhe novo cluster do usuario
-            min_idx, min_valor = min(enumerate(erros_treinamento), key=operator.itemgetter(1))
-            # se houver empate, nao atualiza
-            if (min_valor < erros_treinamento[vetor_clusters_usuarios[usuario]]):
-                novo_cluster[usuario] = min_idx
-                gu[usuario] = gu_por_cluster[min_idx]
+        for thread in threads:
+            thread.join()
         
         # numero de clusters diferentes na iteracao
         mudanca_cluster = 0
         for usuario in range(num_usuarios):
-            if vetor_clusters_usuarios[usuario] != novo_cluster[usuario]:
+            if vetor_clusters_usuarios[usuario] != novo_vetor_clusters_usuarios[usuario]:
                 mudanca_cluster = mudanca_cluster + 1
         percentual_mudancas = float(mudanca_cluster)/num_usuarios
         # atualiza vetor de usuario/cluster
-        vetor_clusters_usuarios = pd.Series(novo_cluster)
-        calcula_submatrizes_Pu()
+        vetor_clusters_usuarios = pd.Series(novo_vetor_clusters_usuarios)
+        calcula_submatrizes_Pu_paralelizado()
         estima_modelo_slim_para_todos_clusters()
-        atualiza_estrutura_dados_su_cluster()
+        atualiza_estrutura_dados_su_cluster_paralelizado()
         print('Percentual de mudancas: %f\n'%(percentual_mudancas))
         
-    return
-
-
-def main():
-    global arq_avaliacoes, num_usuarios, num_itens
-    # le arquivo de avaliações NxM
-    arq_avaliacoes = pd.read_csv(dir_matriz_avaliacoes, header=None)
-    num_usuarios, num_itens = arq_avaliacoes.shape
-    glslim()
-    avalia_modelo()
     return
 
 
@@ -354,6 +439,16 @@ def le_matriz_em_formato_csr_sem_cabecalho(dir_matriz, dimensao_matriz):
         linha = arq.readline()
     arq.close()
     return pd.DataFrame(matriz)
+
+
+def main():
+    global arq_avaliacoes, num_usuarios, num_itens
+    # le arquivo de avaliações NxM
+    arq_avaliacoes = pd.read_csv(dir_matriz_avaliacoes, header=None)
+    num_usuarios, num_itens = arq_avaliacoes.shape
+    glslim()
+    avalia_modelo()
+    return
 
 
 if __name__ == "__main__":

@@ -1,4 +1,7 @@
-**data/*
-!*.keep
-**/old/*
-**/tools/*
+data/*
+old/*
+tools/*
+!**/.keep
+.vscode/*
+*.swp
+doc/*
