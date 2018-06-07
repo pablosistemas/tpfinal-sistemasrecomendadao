@@ -14,7 +14,9 @@ import numpy as np
 import subprocess
 import threading
 import operator
+import cProfile
 import random
+import time
 import sys
 import re
 
@@ -51,7 +53,8 @@ num_usuarios = 0
 num_itens = 0
 tolerancia_treinamento = 1e-5
 N = 10
-
+hit_rate = None
+average_reciprocal_hit_rate = None
 
 class slim_thread(threading.Thread):
     def __init__(self, cluster, tolerancia_treinamento):
@@ -137,7 +140,7 @@ def calcula_clusters_com_cluto(caminho_matriz_cluto, nome_arq_saida_cluto, num_c
 
 def estima_matriz_S_com_sim_learn(caminho_matriz_treinamento, caminho_matriz_saida_modelo,
     coluna_inicial=0, coluna_final=None, optTol=1e-2, lambda_p=1, beta_p=5):
-    parametros_bash = [slim, "-train_file=%s"%(caminho_matriz_treinamento), 
+    parametros_bash = [slim, '-train_file=%s'%(caminho_matriz_treinamento), 
                     '-optTol=%f'%(optTol),
                     '-model_file=%s'%(caminho_matriz_saida_modelo),
                     '-lambda=%f'%(lambda_p),
@@ -155,7 +158,9 @@ def cria_matriz_R_binaria_a_partir_matriz_avaliacoes():
     global R_global
     R_global = arq_avaliacoes.copy()
     R_global[R_global > 0] = 1
-    escreve_matriz_em_formato_csr(R_global.as_matrix(),"%s/%s.R.global.bin.csr"%(dir_entrada_slim_learn,nome_dataset))
+    # Numpy faster than Pandas
+    R_global = R_global.as_matrix()
+    escreve_matriz_em_formato_csr(R_global,"%s/%s.R.global.bin.csr"%(dir_entrada_slim_learn,nome_dataset))
     return
 
 
@@ -194,16 +199,18 @@ def calcula_submatrizes_Pu():
 
 
 def retorna_lista_itens_avaliados_pelo_usuario(usuario):
-    return R_global.ix[usuario,:].index[R_global.ix[usuario,:] == 1].tolist()
+    #return R_global.ix[usuario,:].index[R_global.ix[usuario,:] == 1].tolist()
+    return np.where(R_global[usuario,:] == 1)[0]
 
 
 # FIXME:
 def avalia_modelo():
+    global su_global
     for usuario in range(num_usuarios):
         indices_itens_avaliados_pelo_usuario = retorna_lista_itens_avaliados_pelo_usuario(usuario)
         itens_treino, item_teste = divide_itens_treino_teste(indices_itens_avaliados_pelo_usuario)
         # Ajusta matriz R_global para teste
-        R_global.ix[usuario, item_teste] = 0
+        R_global[usuario, item_teste] = 0
 
         estima_modelo_slim_global()        
         su_global = le_matriz_em_formato_csr_sem_cabecalho("%s/%s.global.csr"%(dir_saida_slim_learn,nome_dataset),(num_itens,num_itens))
@@ -211,7 +218,7 @@ def avalia_modelo():
         estima_modelo_slim_para_todos_clusters_paralelizado()
         atualiza_estrutura_dados_su_cluster_paralelizado()
 
-        top_n = calcula_top_n(usuario, indices_itens_avaliados_pelo_usuario)
+        # top_n = calcula_top_n(usuario, indices_itens_avaliados_pelo_usuario)
 
         # desfaz ajuste matriz R_global
         R_global.ix[usuario, item_teste] = 1
@@ -220,9 +227,8 @@ def avalia_modelo():
 def divide_itens_treino_teste(lista_itens):
     itens_treino = lista_itens[:]
     item_teste = selecionar_item_aleatoriamente(itens_treino)
-    itens_treino.remove(item_teste)
-    return itens_treino, item_teste
-    
+    return item_teste
+
 
 def calcula_top_n(usuario, indices_itens_avaliados_pelo_usuario):
     predicao = [None for item in range(num_itens)]
@@ -236,7 +242,7 @@ def calcula_top_n(usuario, indices_itens_avaliados_pelo_usuario):
 
 
 def selecionar_item_aleatoriamente(lista_itens):
-    return random.sample(lista_itens,1)
+    return random.sample(lista_itens,1)[0]
 
 
 def estima_modelo_slim_global():
@@ -318,60 +324,113 @@ def glslim_treinamento_usuario(usuario):
         gu[usuario] = gu_por_cluster[min_idx]
 
 
+def calcula_hit_rate_e_average_reciprocal_hit_rate(itens_teste):
+    hit = 0
+    arhr = 0
+    for usuario in range(num_usuarios):
+        indices_itens_avaliados_pelo_usuario = retorna_lista_itens_avaliados_pelo_usuario(usuario)
+        top_n = calcula_top_n(usuario, indices_itens_avaliados_pelo_usuario)
+        if itens_teste[usuario] in top_n:
+            hit = hit + 1
+            arhr = arhr + 1.0/(top_n.index(itens_teste[usuario]) + 1)
+    return float(hit)/num_usuarios, float(arhr)/num_usuarios
+
+
+def leave_one_out_cross_validation(k_cross_validation=1):
+    global su_global, hit_rate, average_reciprocal_hit_rate, R_global, vetor_clusters_usuarios
+
+    R_global = le_matriz_em_formato_csr_sem_cabecalho("%s/%s.R.global.bin.csr"%(dir_entrada_slim_learn,nome_dataset),(num_usuarios,num_itens))
+    calcula_clusters_com_cluto('%s/%s.R.csr'%(dir_entrada_cluto,nome_dataset),\
+        '%s/%s.%d.csr'%(dir_saida_cluto,nome_dataset,num_clusters), num_clusters)
+    
+    vetor_clusters_usuarios_backup = vetor_clusters_usuarios
+    
+    hit_rate = average_reciprocal_hit_rate = [0 for k in range(k_cross_validation)]
+    
+    for k in range(k_cross_validation):
+        print('BEGINNING %d CROSS VALIDATION at %s'%(k, time.strftime("%d/%m/%Y %H:%M:%S")))
+        itens_teste = [-1 for usuario in range(num_usuarios)]
+
+        # remove item de teste da matriz de treinamento
+        for usuario in range(num_usuarios):
+            lista_usuario = retorna_lista_itens_avaliados_pelo_usuario(usuario)
+            itens_teste[usuario] = divide_itens_treino_teste(lista_usuario)
+            R_global[usuario,itens_teste[usuario]] = 0
+
+        estima_modelo_slim_global()        
+        su_global = le_matriz_em_formato_csr_sem_cabecalho("%s/%s.global.csr"%(dir_saida_slim_learn,nome_dataset),(num_itens,num_itens))
+    
+        print('BEGIN %d-esimo GLSLIM: %s'%(k, time.strftime("%d/%m/%Y %H:%M:%S")))
+        glslim()
+        print('END %d-esimo GLSLIM: %s'%(k, time.strftime("%d/%m/%Y %H:%M:%S")))
+    
+        hit_rate[k], average_reciprocal_hit_rate[k] = calcula_hit_rate_e_average_reciprocal_hit_rate
+
+        # insere novamente o item removido para treinamento
+        for usuario in range(num_usuarios):
+            R_global[usuario,itens_teste[usuario]] = 1
+        
+        # vetor de cluster inicial foi modificado pelo glslim, restaura inicial para novo treinamento
+        vetor_clusters_usuarios = vetor_clusters_usuarios_backup
+    
+    # calcular media e variancia
+    print('HIT RATE MEDIO: %f\mHIT RATE DESVIO PADRAO: %f\n'%(np.mean(hit_rate), np.std(hit_rate)))
+    print('AVERAGE HIT RATE RECIPROCO  MEDIO: %f\mAVERAGE HIT RATE RECIPROCO DESVIO PADRAO: %f\n'%(np.mean(average_reciprocal_hit_rate), np.std(average_reciprocal_hit_rate)))
+
+
+def executa_nucleo_glslim_paralelo():
+    threads = []
+    for usuario in range(num_usuarios):
+        thread = glslim_thread(usuario)
+        thread.start()
+        threads.append(thread)
+
+    for thread in threads:
+        thread.join()
+
+
+def executa_nucleo_glslim():
+    for usuario in range(num_usuarios):
+        glslim_treinamento_usuario(usuario)
+    
+
 def glslim():
     global gu, R_global, su_global, su_cluster, vetor_clusters_usuarios, novo_vetor_clusters_usuarios
     gu = 0.5 * np.ones((num_usuarios))
     
-    R_global = le_matriz_em_formato_csr_sem_cabecalho("%s/%s.R.global.bin.csr"%(dir_entrada_slim_learn,nome_dataset),(num_usuarios,num_itens))
-    calcula_clusters_com_cluto('%s/%s.R.csr'%(dir_entrada_cluto,nome_dataset),\
-        '%s/%s.%d.csr'%(dir_saida_cluto,nome_dataset,num_clusters), num_clusters)
-    calcula_submatrizes_Pu_paralelizado()
-
     percentual_mudancas = 1
     while percentual_mudancas > 0.01:
+        
+        calcula_submatrizes_Pu_paralelizado()
         novo_vetor_clusters_usuarios = vetor_clusters_usuarios.tolist()
         
-        estima_modelo_slim_global()        
-        # carrega modelos su (em out_slim) de cada cluster
-        su_global = le_matriz_em_formato_csr_sem_cabecalho("%s/%s.global.csr"%(dir_saida_slim_learn,nome_dataset),(num_itens,num_itens))
-
         estima_modelo_slim_para_todos_clusters_paralelizado()
         atualiza_estrutura_dados_su_cluster_paralelizado()
 
-        threads = []
-        for usuario in range(num_usuarios):
-            thread = glslim_thread(usuario)
-            thread.start()
-            threads.append(thread)
+        executa_nucleo_glslim()
 
-        for thread in threads:
-            thread.join()
-        
-        # numero de clusters diferentes na iteracao
-        mudanca_cluster = 0
-        for usuario in range(num_usuarios):
-            if vetor_clusters_usuarios[usuario] != novo_vetor_clusters_usuarios[usuario]:
-                mudanca_cluster = mudanca_cluster + 1
-        percentual_mudancas = float(mudanca_cluster)/num_usuarios
+        percentual_mudancas = retorna_percentual_mudancas()
+
         # atualiza vetor de usuario/cluster
         vetor_clusters_usuarios = pd.Series(novo_vetor_clusters_usuarios)
-        calcula_submatrizes_Pu_paralelizado()
-        estima_modelo_slim_para_todos_clusters()
-        atualiza_estrutura_dados_su_cluster_paralelizado()
         print('Percentual de mudancas: %f\n'%(percentual_mudancas))
-        
+    
     return
 
 
-def verifica_clustering():
-    #mock
-    return True
+# numero de clusters diferentes na iteracao
+def retorna_percentual_mudancas():
+    mudanca_cluster = 0
+    for usuario in range(num_usuarios):
+        if vetor_clusters_usuarios[usuario] != novo_vetor_clusters_usuarios[usuario]:
+            mudanca_cluster = mudanca_cluster + 1
+    return float(mudanca_cluster)/num_usuarios
 
 
 def calcula_predicao_usuario_item(usuario, cluster, item, gu_cluster, indices_itens_avaliados_pelo_usuario):
     predicao = 0
     for item_avaliado in indices_itens_avaliados_pelo_usuario:
-        predicao = predicao + gu_cluster * su_global.ix[item_avaliado,item]  + (1 - gu_cluster) * su_cluster[cluster].ix[item_avaliado,item]
+        predicao = predicao + gu_cluster * su_global[item_avaliado,item]  + (1 - gu_cluster) * su_cluster[cluster][item_avaliado,item]
     
     return predicao
     
@@ -388,7 +447,7 @@ def calcula_erro_predicao(usuario, cluster, gu_cluster, indices_itens_avaliados_
     indices_itens_nao_avaliados_pelo_usuario = retorna_itens_nao_avaliados_pelo_usuario(indices_itens_avaliados_pelo_usuario)
     for item in indices_itens_nao_avaliados_pelo_usuario:
         predicao = calcula_predicao_usuario_item(usuario, cluster, item, gu_cluster, indices_itens_avaliados_pelo_usuario)
-        erro = erro + (arq_avaliacoes.ix[usuario,item] - predicao) ** 2
+        erro = erro + (arq_avaliacoes[usuario,item] - predicao) ** 2
     
     erro = erro/num_itens
     return erro
@@ -401,10 +460,10 @@ def calcula_gu(usuario, cluster, indices_itens_avaliados_pelo_usuario):
         soma_sli = 0
         soma_suli = 0
         for item_similar in indices_itens_avaliados_pelo_usuario:
-            soma_sli = soma_sli + su_global.ix[item_similar,item]
-            soma_suli = soma_suli + su_cluster[cluster].ix[item_similar,item]
+            soma_sli = soma_sli + su_global[item_similar,item]
+            soma_suli = soma_suli + su_cluster[cluster][item_similar,item]
             
-        num = num + (soma_sli - soma_suli) * (R_global.ix[usuario,item] - soma_suli)
+        num = num + (soma_sli - soma_suli) * (R_global[usuario,item] - soma_suli)
         den = den + (soma_sli - soma_suli)**2
 
     # evita NaN
@@ -446,20 +505,36 @@ def le_matriz_em_formato_csr_sem_cabecalho(dir_matriz, dimensao_matriz):
         contador_linha = contador_linha + 1
         linha = arq.readline()
     arq.close()
-    return pd.DataFrame(matriz)
+    return matriz
 
 
-def leave_one_out_cross_validation():
-    pass
+def teste_numpy():
+    global arq_avaliacoes_np
+    linhas, colunas = arq_avaliacoes_np.shape
+    for i in range(linhas):
+        for j in range(colunas):
+            arq_avaliacoes_np[i,j] = i*j
+
+
+def teste_pandas(arq_avaliacoes):
+    linhas, colunas = arq_avaliacoes.shape
+    for i in range(linhas):
+        for j in range(colunas):
+            arq_avaliacoes.loc[i,j] = i*j
 
 
 def main():
     global arq_avaliacoes, num_usuarios, num_itens
     # le arquivo de avaliações NxM
     arq_avaliacoes = pd.read_csv(dir_matriz_avaliacoes, header=None)
+    arq_avaliacoes = arq_avaliacoes.as_matrix()
+
+    #cProfile.run('teste_pandas(arq_avaliacoes)')
+    #cProfile.run('teste_numpy()')
+
     num_usuarios, num_itens = arq_avaliacoes.shape
-    glslim()
-    avalia_modelo()
+    leave_one_out_cross_validation(1)
+    #avalia_modelo()
     return
 
 
@@ -468,4 +543,4 @@ if __name__ == "__main__":
     random.seed(1234)
     inicializa_variaveis_globais()
     main()
-    
+        

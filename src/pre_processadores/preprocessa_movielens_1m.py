@@ -45,7 +45,7 @@ esparsidade_dataset = float(movie_lens[movie_lens != 0].count().sum())/movie_len
 movie_lens.to_csv("%s/%s.csv"%(diretorio_matriz_avaliacoes, nome_dataset), header=False, index=False)
 
 ## SUBAMOSTRA DATASET
-num_amostras = 50
+num_amostras = 400
 movie_lens_sampled = movie_lens.sample(n=num_amostras, axis=0).sample(n=num_amostras, axis=1)
 esparsidade_dataset_sampled = float(movie_lens_sampled[movie_lens_sampled != 0].count().sum())/movie_lens_sampled.size
 
