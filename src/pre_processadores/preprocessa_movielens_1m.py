@@ -29,14 +29,13 @@ while linha:
         
 arquivo.close()
 
-## REMOVE COLUNAS COM TODOS OS VALORES ZERO
-colunas_diferentes_de_zero = movie_lens.apply(sum, axis=0) != 0
-movie_lens = movie_lens.loc[:,colunas_diferentes_de_zero]
-
 ## REMOVE LINHAS COM TODOS OS VALORES ZERO
 linhas_diferentes_de_zero = movie_lens.apply(sum, axis=1) != 0
 movie_lens = movie_lens.loc[linhas_diferentes_de_zero,:]
 
+## REMOVE COLUNAS COM TODOS OS VALORES ZERO
+colunas_diferentes_de_zero = movie_lens.apply(sum, axis=0) != 0
+movie_lens = movie_lens.loc[:,colunas_diferentes_de_zero]
 
 ## ESCREVE MATRIZ AVALIACOES EM CSV NO DIRETORIO DE RATINGS
 
@@ -49,13 +48,14 @@ num_amostras = 400
 movie_lens_sampled = movie_lens.sample(n=num_amostras, axis=0).sample(n=num_amostras, axis=1)
 esparsidade_dataset_sampled = float(movie_lens_sampled[movie_lens_sampled != 0].count().sum())/movie_lens_sampled.size
 
-## REMOVE COLUNAS COM TODOS OS VALORES ZERO
-colunas_diferentes_de_zero = movie_lens_sampled.apply(sum, axis=0) != 0
-movie_lens_sampled = movie_lens_sampled.loc[:,colunas_diferentes_de_zero]
-
 ## REMOVE LINHAS COM TODOS OS VALORES ZERO
-linhas_diferentes_de_zero = movie_lens_sampled.apply(sum, axis=1) != 0
+linhas_diferentes_de_zero = movie_lens_sampled.apply(sum, axis=1) >= 30
 movie_lens_sampled = movie_lens_sampled.loc[linhas_diferentes_de_zero,:]
+    
+## REMOVE COLUNAS COM TODOS OS VALORES ZERO
+colunas_diferentes_de_zero = movie_lens_sampled.apply(sum, axis=0) >= 25
+movie_lens_sampled.shape
+movie_lens_sampled = movie_lens_sampled.loc[:,colunas_diferentes_de_zero]
 
 movie_lens_sampled.to_csv("%s/%s.csv"%(diretorio_matriz_avaliacoes, nome_dataset), header=False, index=False)
 
